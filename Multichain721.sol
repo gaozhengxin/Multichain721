@@ -4,24 +4,6 @@ import {ERC721} from "./ERC721.sol";
 
 pragma solidity ^0.8.0;
 
-abstract contract DemoERC721WithState is ERC721 {
-    struct Profile {
-        uint256 foo;
-        uint256 bar;
-    }
-
-    mapping(uint256 => Profile) public profile;
-
-    function setProfile(uint256 tokenId, uint256 foo, uint256 bar) public {
-        require(ownerOf(tokenId) == msg.sender);
-        profile[tokenId] = Profile(foo, bar);
-    }
-}
-
-interface Anycall {
-    function anyCall(address[] memory to,bytes[] memory data,address[] memory callbacks,uint256[] memory nonces,uint256 toChainID) external;
-}
-
 contract DemoMultiChain721WithState is DemoERC721WithState {
     address public anycall;
 
@@ -36,40 +18,68 @@ contract DemoMultiChain721WithState is DemoERC721WithState {
         anycall = _anycall;
     }
 
-    mapping(uint256 => address) public branchToken;
+    mapping(uint256 => address) public branchTokens;
 
     event LogOutbound(uint256 tokenId, address receiver, uint256 toChainId);
     event LogInbound(uint256 tokenId, address receiver, uint256 fromChainId);
+    event LogOutboundRevert(uint256 nonce, uint256 tokenId, address receiver);
+
+    uint256 public outboundNonce = 0;
+    struct OutboundArg {
+        address owner;
+        uint256 tokenId;
+        State state;
+    }
+    mapping(uint256 => OutboundArg) public outboundArgs;
 
     function outbound(uint256 tokenId, address receiver, uint256 toChainId) public {
-        // pack token state
-        bytes memory state = abi.encode(profile[tokenId].foo, profile[tokenId].bar);
-        // lock or burn
+        require(ownerOf(tokenId) == msg.sender);
+
+        // state is not changable after burn
         _burn(tokenId);
+
+        // snapshot token state
+        bytes memory state = abi.encode(states[tokenId].foo, states[tokenId].bar);
+
+        // record nonce
+        outboundArgs[outboundNonce] = OutboundArg(msg.sender, tokenId, states[tokenId]);
+        outboundNonce++;
 
         // call anycall
         bytes memory data = abi.encodeWithSignature("inbound(uint256,address,bytes,uint256)", tokenId, receiver, state, toChainId);
         address[] memory to;
-        to[0] = branchToken[toChainId];
+        to[0] = branchTokens[toChainId];
         bytes[] memory datas;
         datas[0] = data;
-        address[] memory callbacks;
+        address[] memory fallbacks;
+        fallbacks[0] = address(this);
         uint256[] memory nonces;
-        Anycall(anycall).anyCall(to, datas, callbacks, nonces, toChainId);
+        nonces[0] = outboundNonce;
+        Anycall(anycall).anyCall(to, datas, fallbacks, nonces, toChainId);
 
         emit LogOutbound(tokenId, receiver, toChainId);
 
         return;
     }
 
-    function inbound(uint256 tokenId, address receiver, bytes memory state, uint256 fromChainId) public {
-        // unpack token stsate
-        (uint256 foo, uint256 bar) = abi.decode(state, (uint256, uint256));
-        profile[tokenId] = Profile(foo, bar);
+    function anyCallFallback(uint256 nonce) public onlyAnyCall {
+        // retrieve outbound args
+        OutboundArg memory args = outboundArgs[nonce];
+        require(!_exists(args.tokenId));
+        _mint(args.owner, args.tokenId);
+        states[args.tokenId] = args.state;
+        outboundArgs[nonce] = OutboundArg(address(0), uint256(0), State(uint256(0), uint256(0)));
+        emit LogOutboundRevert(nonce, args.tokenId, args.owner);
+    }
 
+    function inbound(uint256 tokenId, address receiver, bytes memory state, uint256 fromChainId) public onlyAnyCall {
         // unlock or mint and sync profile
         require(!_exists(tokenId));
         _mint(receiver, tokenId);
+
+        // unpack token stsate
+        (uint256 foo, uint256 bar) = abi.decode(state, (uint256, uint256));
+        states[tokenId] = State(foo, bar);
 
         emit LogInbound(tokenId, receiver, fromChainId);
 
