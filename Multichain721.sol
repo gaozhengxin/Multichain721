@@ -1,24 +1,73 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
 
 import {ERC721} from "./ERC721.sol";
 
-pragma solidity ^0.8.0;
+abstract contract DemoERC721 is ERC721 {
+    uint256 public chainPrefix;
+
+    constructor () {
+        chainPrefix = block.chainid;
+        chainPrefix <<= 128;
+    }
+
+    function claim(uint128 seed) public returns (uint256 globalTokenId) {
+        globalTokenId = chainPrefix + seed;
+        require(!_exists(globalTokenId));
+        _mint(msg.sender, globalTokenId);
+    }
+
+    function localId(uint256 globalId) public view returns (uint256 localId) {
+        localId = globalId - chainPrefix;
+    }
+}
+
+abstract contract DemoERC721WithState is DemoERC721 {
+    struct State {
+        uint256 foo;
+        uint256 bar;
+    }
+
+    mapping(uint256 => State) public states;
+
+    function setState(uint256 tokenId, uint256 foo, uint256 bar) public {
+        require(ownerOf(tokenId) == msg.sender);
+        states[tokenId] = State(foo, bar);
+    }
+}
+
+interface Anycall {
+    function anyCall(address[] memory to,bytes[] memory data,address[] memory fallbacks,uint256[] memory nonces,uint256 toChainID) external;
+}
 
 contract DemoMultiChain721WithState is DemoERC721WithState {
     address public anycall;
 
-    address public lockAddress = address(0);
+    address public admin;
 
     modifier onlyAnyCall() {
         require(msg.sender == anycall);
         _;
     }
 
-    constructor(string memory name, string memory symbol, address _anycall) ERC721(name, symbol) {
+    constructor(string memory name, string memory symbol, address _anycall, address _admin) ERC721(name, symbol) {
         anycall = _anycall;
+        admin = _admin;
     }
 
-    mapping(uint256 => address) public branchTokens;
+    mapping(uint256 => address) public partnerTokens;
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin);
+        _;
+    }
+
+    function setPartnerTokens(uint256[] calldata chainIds, address[] calldata tokens) external onlyAdmin {
+        for (uint8 i = 0; i < chainIds.length; i++) {
+            partnerTokens[chainIds[i]] = tokens[i];
+        }
+    }
 
     event LogOutbound(uint256 tokenId, address receiver, uint256 toChainId);
     event LogInbound(uint256 tokenId, address receiver, uint256 fromChainId);
@@ -34,6 +83,7 @@ contract DemoMultiChain721WithState is DemoERC721WithState {
 
     function outbound(uint256 tokenId, address receiver, uint256 toChainId) public {
         require(ownerOf(tokenId) == msg.sender);
+        //require(toChainId != block.chainid);
 
         // state is not changable after burn
         _burn(tokenId);
@@ -47,14 +97,16 @@ contract DemoMultiChain721WithState is DemoERC721WithState {
 
         // call anycall
         bytes memory data = abi.encodeWithSignature("inbound(uint256,address,bytes,uint256)", tokenId, receiver, state, toChainId);
-        address[] memory to;
-        to[0] = branchTokens[toChainId];
-        bytes[] memory datas;
+
+        address[] memory to = new address[](1);
+        to[0] = partnerTokens[toChainId];
+        bytes[] memory datas = new bytes[](1);
         datas[0] = data;
-        address[] memory fallbacks;
+        address[] memory fallbacks = new address[](1);
         fallbacks[0] = address(this);
-        uint256[] memory nonces;
+        uint256[] memory nonces = new uint256[](1);
         nonces[0] = outboundNonce;
+    
         Anycall(anycall).anyCall(to, datas, fallbacks, nonces, toChainId);
 
         emit LogOutbound(tokenId, receiver, toChainId);
